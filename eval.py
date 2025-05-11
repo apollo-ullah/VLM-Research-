@@ -1,5 +1,5 @@
-# evaluate_flamingo_fixed.py - 2025-05-09
-# Fixed evaluation script for comparing baseline and fine-tuned OpenFlamingo models
+# evaluate_flamingo.py - 2025-05-09
+# Evaluation script for comparing baseline and fine-tuned OpenFlamingo models
 
 import os
 import sys
@@ -16,7 +16,7 @@ from datetime import datetime
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from types import MethodType
 
 # Set up logging
@@ -44,19 +44,45 @@ BASELINE_MODEL_PATH = "./baseline_model"
 FINETUNED_MODEL_PATH = "./flamingo_lora_output/best_model"
 
 
-# Properly patch the Flamingo model for generation
-def patch_flamingo_for_generation(model):
-    """Apply minimal patches needed for generation with Flamingo"""
-    # We're not going to do extensive patching that can cause issues with LoRA
-    # Just add a basic method for getting embeddings if needed
+# Properly patch the Flamingo model for LoRA and generation
+def properly_patch_flamingo(model):
+    """
+    Apply all necessary patches to the OpenFlamingo model for evaluation.
+    """
+
+    # Add generation method
+    def _prepare_inputs_for_generation(self, input_ids=None, **kwargs):
+        """Convert input_ids to lang_x for OpenFlamingo."""
+        if input_ids is not None and "lang_x" not in kwargs:
+            kwargs["lang_x"] = input_ids
+        return kwargs
+
+    # Add minimal config
+    from transformers import PretrainedConfig
+
+    if not hasattr(model, "config"):
+        model.config = PretrainedConfig()
+        model.config.model_type = "openflamingo"
+        model.config.is_encoder_decoder = False
+
+    # Add prepare_inputs_for_generation method
+    model.prepare_inputs_for_generation = MethodType(
+        _prepare_inputs_for_generation, model
+    )
+
+    # Add input_embedding accessors if needed
     if not hasattr(model, "get_input_embeddings"):
 
         def _get_input_embeddings(self):
             return self.lang_encoder.get_input_embeddings()
 
-        model.get_input_embeddings = MethodType(_get_input_embeddings, model)
+        def _set_input_embeddings(self, value):
+            self.lang_encoder.set_input_embeddings(value)
 
-    logger.info("Applied minimal patches to Flamingo model")
+        model.get_input_embeddings = MethodType(_get_input_embeddings, model)
+        model.set_input_embeddings = MethodType(_set_input_embeddings, model)
+
+    logger.info("Applied all necessary patches to Flamingo model")
     return model
 
 
@@ -160,143 +186,67 @@ class CaptioningEvalDataset(Dataset):
         return {"image": image, "image_path": image_path, "caption": sample["caption"]}
 
 
-# Generate captions with either type of model (base or LoRA)
-def generate_caption_single(
-    model, processor, tokenizer, image, device, max_new_tokens=50
+# Generation function for OpenFlamingo
+def generate_captions_batch(
+    model, processor, tokenizer, images, device, max_new_tokens=30
 ):
-    """Generate a caption for a single image with either model type"""
-    # Process the image
-    processed_image = processor(image)
+    """Generate captions for a batch of images"""
+    # Process images with CLIP processor
+    processed_images = [processor(img) for img in images]
     vision_x = (
-        processed_image.unsqueeze(0).unsqueeze(0).unsqueeze(0).to(device, dtype=dtype)
+        torch.stack(processed_images).unsqueeze(1).unsqueeze(1).to(device, dtype=dtype)
     )
 
-    # Initialize with prompt template
+    # Initialize with the prompt template
     prompt_template = "<image><|endofchunk|>"
-    tokens = tokenizer(prompt_template, return_tensors="pt").to(device)
-    input_ids = tokens.input_ids
-    attention_mask = tokens.attention_mask
 
-    # Generate tokens one by one
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            try:
-                # Try regular model format first (direct with lang_x)
+    generated_captions = []
+
+    # Process each image one by one
+    for i in range(vision_x.size(0)):
+        img_tensor = vision_x[i : i + 1]  # Take one image
+
+        # Create the prompt
+        inputs = tokenizer(prompt_template, return_tensors="pt").to(device)
+        input_ids = inputs.input_ids
+
+        # Keep track of generated tokens
+        all_tokens = []
+
+        # Generate tokens one by one
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                # Run the model
                 outputs = model(
-                    vision_x=vision_x,
+                    vision_x=img_tensor,
                     lang_x=input_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=torch.ones_like(input_ids),
                 )
-            except TypeError as e:
-                if "input_ids" in str(e):
-                    # If error mentions input_ids, try a different argument format
-                    try:
-                        # This format might work with PEFT models
-                        outputs = model(
-                            vision_x=vision_x,
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                        )
-                    except:
-                        # If that fails too, try a simpler approach with just vision_x
-                        outputs = model.forward(
-                            vision_x=vision_x,
-                            lang_x=input_ids,
-                        )
-                else:
-                    # Some other error, re-raise it
-                    raise
 
-            # Get logits (handle tuple or object return)
-            if isinstance(outputs, tuple):
-                logits = outputs[0]
-            else:
-                logits = outputs.logits
+                # Get next token logits from the last position
+                next_token_logits = outputs[0][:, -1, :]
 
-            # Get next token probabilities from the last position
-            next_token_logits = logits[:, -1, :]
-            next_token_logits = next_token_logits / 0.8  # temperature
+                # Apply temperature
+                next_token_logits = next_token_logits / 1.0  # temperature
 
-            # Apply softmax to get probabilities
-            probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+                # Greedy decoding (take the most probable token)
+                next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
 
-            # Sample next token
-            next_token = torch.multinomial(probs, num_samples=1)
+                # Add to generated
+                all_tokens.append(next_token.item())
 
-            # Append to input_ids
-            input_ids = torch.cat([input_ids, next_token], dim=1)
-            attention_mask = torch.ones_like(input_ids)
+                # Add to the input_ids for next iteration
+                input_ids = torch.cat([input_ids, next_token], dim=1)
 
-            # Check for EOS token
-            if next_token.item() == tokenizer.eos_token_id:
-                break
+                # Stop on EOS token or max length
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
 
-    # Decode the generated text
-    generated_text = tokenizer.decode(
-        input_ids[0][len(tokens.input_ids[0]) :], skip_special_tokens=True
-    ).strip()
-    return generated_text
+        # Decode the generated caption
+        generated_text = tokenizer.decode(all_tokens, skip_special_tokens=True).strip()
+        generated_captions.append(generated_text)
 
-
-# Main evaluation function
-def evaluate_model(model, processor, tokenizer, dataset, model_name):
-    """Evaluate a model on a dataset with multiple metrics"""
-    logger.info(f"Evaluating {model_name} model...")
-    model.eval()
-
-    all_preds = []
-    all_refs = []
-    all_image_paths = []
-
-    # Process images one by one to avoid batch processing issues
-    for idx in tqdm(range(len(dataset)), desc=f"Generating captions - {model_name}"):
-        sample = dataset[idx]
-        image = sample["image"]
-        caption = sample["caption"]
-        image_path = sample["image_path"]
-
-        try:
-            # Generate caption
-            generated_caption = generate_caption_single(
-                model, processor, tokenizer, image, device
-            )
-
-            # Store results
-            all_preds.append(generated_caption)
-            all_refs.append(caption)
-            all_image_paths.append(image_path)
-
-            # Log occasionally
-            if idx % 5 == 0:
-                logger.info(f"Sample {idx}: {os.path.basename(image_path)}")
-                logger.info(f"  Generated: {generated_caption}")
-                logger.info(f"  Reference: {caption}")
-
-        except Exception as e:
-            logger.error(f"Error generating caption for image {idx}: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    # Calculate metrics
-    results = {}
-
-    # BLEU
-    logger.info(f"Computing BLEU scores for {model_name}...")
-    bleu_scores = compute_bleu(all_preds, all_refs)
-    results.update(bleu_scores)
-
-    # ROUGE
-    logger.info(f"Computing ROUGE scores for {model_name}...")
-    rouge_scores = compute_rouge(all_preds, all_refs)
-    results.update(rouge_scores)
-
-    # METEOR
-    logger.info(f"Computing METEOR scores for {model_name}...")
-    meteor_scores = compute_meteor(all_preds, all_refs)
-    results.update(meteor_scores)
-
-    return results, all_preds, all_refs, all_image_paths
+    return generated_captions
 
 
 # Metric functions
@@ -361,6 +311,82 @@ def compute_meteor(predictions, references):
         meteor_scores.append(score)
 
     return {"meteor": sum(meteor_scores) / max(len(meteor_scores), 1)}
+
+
+# Main evaluation function
+def evaluate_model(model, processor, tokenizer, dataset, model_name, batch_size=4):
+    """Evaluate a model on a dataset with multiple metrics"""
+    logger.info(f"Evaluating {model_name} model...")
+    model.eval()
+
+    all_preds = []
+    all_refs = []
+    all_image_paths = []
+
+    # Process in mini-batches
+    total_samples = len(dataset)
+    for batch_start in tqdm(
+        range(0, total_samples, batch_size), desc=f"Generating captions - {model_name}"
+    ):
+        batch_end = min(batch_start + batch_size, total_samples)
+        batch_indices = list(range(batch_start, batch_end))
+
+        # Collect batch data
+        batch_images = []
+        batch_captions = []
+        batch_paths = []
+
+        for idx in batch_indices:
+            sample = dataset[idx]
+            batch_images.append(sample["image"])
+            batch_captions.append(sample["caption"])
+            batch_paths.append(sample["image_path"])
+
+        try:
+            # Generate captions for the batch
+            batch_preds = generate_captions_batch(
+                model, processor, tokenizer, batch_images, device
+            )
+
+            # Store results
+            all_preds.extend(batch_preds)
+            all_refs.extend(batch_captions)
+            all_image_paths.extend(batch_paths)
+
+            # Log occasionally
+            if batch_start % (batch_size * 5) == 0 or batch_start == 0:
+                for i in range(min(2, len(batch_preds))):
+                    logger.info(
+                        f"Sample {batch_start + i}: {os.path.basename(batch_paths[i])}"
+                    )
+                    logger.info(f"  Generated: {batch_preds[i]}")
+                    logger.info(f"  Reference: {batch_captions[i]}")
+
+        except Exception as e:
+            logger.error(f"Error processing batch {batch_start}:{batch_end}: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    # Calculate metrics
+    results = {}
+
+    # BLEU
+    logger.info(f"Computing BLEU scores for {model_name}...")
+    bleu_scores = compute_bleu(all_preds, all_refs)
+    results.update(bleu_scores)
+
+    # ROUGE
+    logger.info(f"Computing ROUGE scores for {model_name}...")
+    rouge_scores = compute_rouge(all_preds, all_refs)
+    results.update(rouge_scores)
+
+    # METEOR
+    logger.info(f"Computing METEOR scores for {model_name}...")
+    meteor_scores = compute_meteor(all_preds, all_refs)
+    results.update(meteor_scores)
+
+    return results, all_preds, all_refs, all_image_paths
 
 
 def create_visualizations(metrics_df, samples_df, timestamp):
@@ -439,7 +465,7 @@ def create_visualizations(metrics_df, samples_df, timestamp):
 
     # Add value labels
     for i, v in enumerate(improvement):
-        plt.text(i, v + 0.5 if v >= 0 else v - 5, f"{v:.1f}%", ha="center")
+        plt.text(i, v + 0.5, f"{v:.1f}%", ha="center")
 
     plt.tight_layout()
     plt.savefig(f"evaluation_results/improvement_percentage_{timestamp}.png")
@@ -469,7 +495,7 @@ def main():
         logger.info("Loading models and tokenizer...")
 
         # First create the tokenizer and processor which will be shared
-        _, image_processor, tokenizer = create_model_and_transforms(
+        model, image_processor, tokenizer = create_model_and_transforms(
             clip_vision_encoder_path="ViT-L-14",
             clip_vision_encoder_pretrained="openai",
             lang_encoder_path="togethercomputer/RedPajama-INCITE-Base-3B-v1",
@@ -494,7 +520,7 @@ def main():
         }
         tokenizer.add_special_tokens(special_tokens)
 
-        # Load baseline model
+        # First load and patch the baseline model
         baseline_model, _, _ = create_model_and_transforms(
             clip_vision_encoder_path="ViT-L-14",
             clip_vision_encoder_pretrained="openai",
@@ -503,10 +529,10 @@ def main():
             cross_attn_every_n_layers=1,
         )
 
-        # Only do minimal patching to avoid issues
-        baseline_model = patch_flamingo_for_generation(baseline_model)
+        # Patch it before loading checkpoint
+        baseline_model = properly_patch_flamingo(baseline_model)
 
-        # Load baseline checkpoint if available
+        # Load a checkpoint for the baseline model if available
         if os.path.exists(os.path.join(BASELINE_MODEL_PATH, "checkpoint.pt")):
             logger.info(
                 f"Loading baseline model from {BASELINE_MODEL_PATH}/checkpoint.pt"
@@ -530,10 +556,10 @@ def main():
             cross_attn_every_n_layers=1,
         )
 
-        # Minimal patching for finetuned model
-        finetuned_base_model = patch_flamingo_for_generation(finetuned_base_model)
+        # CRITICAL: Apply patches BEFORE loading PEFT model
+        finetuned_base_model = properly_patch_flamingo(finetuned_base_model)
 
-        # Load with PEFT
+        # Now wrap with PEFT
         from peft import PeftModel
 
         logger.info(f"Loading fine-tuned LoRA model from {FINETUNED_MODEL_PATH}")
@@ -555,7 +581,7 @@ def main():
         eval_dataset = CaptioningEvalDataset(
             IMAGES_DIR,
             CAPTIONS_FILE,
-            limit=20,  # Limit to 20 images for faster evaluation
+            limit=30,  # Limit to 30 images for faster evaluation
         )
     except Exception as e:
         logger.error(f"Error loading dataset: {e}")
@@ -602,9 +628,7 @@ def main():
         finetuned_value = finetuned_results[metric]
         diff = finetuned_value - baseline_value
         # Calculate percentage improvement
-        pct_improvement = (
-            (diff / baseline_value * 100) if baseline_value != 0 else float("inf")
-        )
+        pct_improvement = (diff / baseline_value * 100) if baseline_value != 0 else 0
 
         results_table["Metric"].append(metric)
         results_table["Baseline"].append(baseline_value)
@@ -617,9 +641,7 @@ def main():
     # Format numeric columns
     for col in ["Baseline", "Fine-tuned", "Difference"]:
         df[col] = df[col].map(lambda x: f"{x:.4f}")
-    df["% Improvement"] = df["% Improvement"].map(
-        lambda x: f"{x:.2f}%" if not np.isinf(x) else "N/A"
-    )
+    df["% Improvement"] = df["% Improvement"].map(lambda x: f"{x:.2f}%")
 
     logger.info("\n=== EVALUATION RESULTS ===")
     logger.info(df.to_string(index=False))
@@ -631,8 +653,8 @@ def main():
             {
                 "Image": os.path.basename(image_paths[i]),
                 "Reference": references[i],
-                "Baseline": baseline_preds[i] if i < len(baseline_preds) else "",
-                "Fine-tuned": finetuned_preds[i] if i < len(finetuned_preds) else "",
+                "Baseline": baseline_preds[i],
+                "Fine-tuned": finetuned_preds[i],
             }
         )
 
